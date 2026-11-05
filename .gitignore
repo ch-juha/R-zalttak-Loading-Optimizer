@@ -1,0 +1,13 @@
+.env
+.env.*
+!.env.example
+
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+bb_results/
+baseline_results/
+*.process.log
+.vscode/
