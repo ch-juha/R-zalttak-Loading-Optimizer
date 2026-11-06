@@ -1,11 +1,5 @@
-"""Bayesian optimization (GP + EI) of stage-1 RD, VG for fixed black-box (Rin || Cin) cases.
-
-Optional LLM step (from the team's llm_optimizer.py): after the loaded-baseline measurement, an
-OpenAI model sees only measured values (never Rin/Cin) and returns a diagnosis, RD/VG bounds and
-3 initial (RD, VG) candidates. Those candidates and the remaining initial samples (inside the
-bounds) replace the LHS initial points within the same 30-evaluation budget; the BO itself still
-searches the full hard BOUNDS. After BO, live LLM runs diagnose the measurements and may request
-one CS + source-follower simulation with the same load and target.
+"""CS amp의 RD, VG를 Bayesian Optimization으로 최적화.
+LLM을 사용하는 경우 초기 탐색 범위와 후보값을 추천받음.
 """
 import argparse
 import csv
@@ -33,20 +27,19 @@ from bb_loading import (COLUMNS, DEFAULT_NGSPICE, bb_cases, evaluate, evaluate_s
                         find_case, find_exe, measure_target, stage1_row)
 from llm_optimizer import propose_circuit_change
 
-# BO 탐색 변수 (1단 설계만): 팀 기존 sweep 범위, CL은 Baseline 1 pF 고정, Rin/Cin은 Case로 고정
+# CL과 부하조건은 고정하고 RD, VG만 최적화
 BOUNDS = dict(rd_ohm=(1e3, 30e3), vg_v=(0.8, 1.6))
 SF_RS2_OHM = 2000.0  # existing CS + SF design
-MARGIN_REQ = 0.05  # run_cs.py --sat-margin 기본값과 동일
-PENALTY_PER_V = 2.0  # Saturation margin 부족 1 V당 비용 (상대오차 200%에 해당)
+MARGIN_REQ = 0.05  # saturation margin 기준
+PENALTY_PER_V = 2.0  # Saturation margin 위반에 대한 벌점 계수
 FAIL_COST = 3.0  # ngspice 실패 시 비용
-EPS = 1e-5  # log(cost + EPS): 0 근처 오차 골짜기를 GP가 구분하도록
+EPS = 1e-5  # 로그 변환시 0 방지
 
-# LLM에 보내는 부하 연결 직후 측정값 화이트리스트 (팀 결정). Rin, Cin, Case 이름/ID, 파일명,
-# Rin·Cin으로 계산한 손계산/극점 값은 보내지 않음
+# LLM엔 측정값만 전달하고 실제 부하 정보는 제외
 LOADED_KEYS = ("gain_1k", "gain_100k", "vout_dc", "id_dc", "gm_s", "region1", "sat_margin1_v")
 REGIONS = ("saturation", "triode", "cutoff")
 N_LLM_CANDIDATES = 3
-# 요청 JSON에 부하 정보가 섞였는지 검사하는 2차 방어선 (1차는 화이트리스트 구조 검사)
+# LLM입력에 부하 정보가 포함되었는지 확인
 LEAK_PATTERN = re.compile(r"(?i)\b(rin|cin)\b|rin_|cin_|\bbb\d{2}\b|\br[\d.]+k_c|bb_case|case_id|"
                           r"netlist|\.cir\b|\.log\b|hand_|pole")
 LLM_SYSTEM = ("You assist a Bayesian optimizer that restores the 1 kHz voltage gain of a common-source "
@@ -60,7 +53,7 @@ LLM_SYSTEM = ("You assist a Bayesian optimizer that restores the 1 kHz voltage g
               "Do not claim that target recovery is physically achievable.")
 
 
-# [0,1]^2 <-> 실제 설계값 (RD는 log 스케일)
+# RD는 log 스케일, VG는 선형 스케일로 변환
 def to_design(x):
     (rd_lo, rd_hi), (vg_lo, vg_hi) = BOUNDS["rd_ohm"], BOUNDS["vg_v"]
     return dict(rd_ohm=round(rd_lo * (rd_hi / rd_lo) ** x[0], 3),
@@ -77,7 +70,7 @@ def feasible(rec):
     return rec["status"] == "ok" and rec["sat_margin1_v"] >= MARGIN_REQ
 
 
-# 목적함수: |A_loaded - A_target| / A_target + Saturation margin 부족 벌점
+# saturation margin에 따른 벌점 부여
 def cost(rec):
     if rec["status"] != "ok":
         return FAIL_COST
@@ -85,7 +78,7 @@ def cost(rec):
             + PENALTY_PER_V * max(0.0, MARGIN_REQ - rec["sat_margin1_v"]))
 
 
-# GP를 log(cost)에 맞추고 Expected Improvement가 최대인 다음 후보를 고름
+# GP 학습한 뒤 Expected Improvement가 최대인 다음 후보를 고름
 def propose(X, y, rng, n_random=4000, n_local=1000, xi=0.01):
     kernel = (ConstantKernel(1.0, (1e-3, 1e3))
               * Matern(length_scale=[0.2, 0.2], length_scale_bounds=(1e-2, 10.0), nu=2.5)
@@ -99,7 +92,7 @@ def propose(X, y, rng, n_random=4000, n_local=1000, xi=0.01):
     candidates = np.vstack([rng.random((n_random, 2)),
                             np.clip(best + 0.05 * rng.standard_normal((n_local, 2)), 0, 1)])
     distance = np.linalg.norm(candidates[:, None, :] - X[None, :, :], axis=2).min(axis=1)
-    candidates = candidates[distance > 1e-3]  # 이미 평가한 점과 거의 같은 후보 제외
+    candidates = candidates[distance > 1e-3] 
     mean, std = gp.predict(candidates, return_std=True)
     improvement = y.min() - mean - xi
     z = improvement / np.maximum(std, 1e-12)
@@ -113,9 +106,6 @@ def best_record(history):
     return min(ok, key=lambda r: r["error_abs"]) if ok else None
 
 
-# ---- LLM 범위 제안 (팀원 llm_optimizer.py의 propose_bounds/validate_bounds 기반) ----
-
-# JSON 저장용: numpy 값은 Python 값으로, NaN/Infinity는 null로
 def jsonable(value):
     if isinstance(value, dict):
         return {k: jsonable(v) for k, v in value.items()}
@@ -135,7 +125,7 @@ def dump(path, value):
                     encoding="utf-8")
 
 
-# LLM 입력: Target, 부하 연결 직후 측정값, Baseline RD/VG, 고정 회로 조건, 하드 범위만
+# LLM에 전달할 측정값, 설계 조건 구성
 def llm_state(target, loaded):
     base = stage1_row()
     return dict(target_gain_1k_vv=target,
@@ -155,8 +145,7 @@ def _number(value, name):
     return float(value)
 
 
-# LLM 요청 전 모든 필드 검사: 키 구조가 llm_state()와 정확히 같고 값이 유한한 숫자/허용 문자열인지,
-# 그리고 직렬화한 JSON에 Rin/Cin/Case/파일명/손계산 흔적이 없는지
+# LLM 입력 형식 및 부하 정보 포함 여부 검사
 def validate_llm_state(state, reference=None):
     reference = reference or llm_state(1.0, dict.fromkeys(LOADED_KEYS, 1.0) | {"region1": REGIONS[0]})
 
@@ -185,7 +174,7 @@ def validate_llm_state(state, reference=None):
     return state
 
 
-# LLM이 하드 범위를 넓히거나 다른 변수를 추가하지 못하게 검사 (팀원 코드와 동일)
+# LLM 추천 범위가 허용 범위를 벗어나는지 확인
 def validate_bounds(bounds, hard):
     if set(bounds) != set(hard):
         raise ValueError("Bounds must contain only rd_ohm and vg_v")
@@ -204,7 +193,7 @@ ADVICE_KEYS = ("diagnosis", "rd_min_ohm", "rd_max_ohm", "vg_min_v", "vg_max_v",
                "initial_candidates", "rationale")
 
 
-# 구조화 출력 스키마: 진단, RD/VG 추천 범위, 초기 후보 3개, 근거 (off 모드에서는 pydantic을 import하지 않음)
+# LLM 응답 형식 정의
 def advice_model():
     from pydantic import BaseModel, Field
 
@@ -224,7 +213,7 @@ def advice_model():
     return Advice
 
 
-# LLM 출력 검사: 키/형식, 하드 범위 안의 추천 범위(validate_bounds), 추천 범위 안의 서로 다른 후보 3개
+# LLM 추천 범위와 초기 후보 검증
 def validate_advice(raw):
     if not isinstance(raw, dict) or set(raw) != set(ADVICE_KEYS):
         raise ValueError(f"LLM output keys must be exactly {list(ADVICE_KEYS)}")
@@ -251,18 +240,17 @@ def validate_advice(raw):
     base = stage1_row()
     points = [to_unit(base)] + [to_unit(d) for d in designs]
     for i, j in itertools.combinations(range(len(points)), 2):
-        if np.linalg.norm(points[i] - points[j]) <= 1e-3:  # propose()의 중복 후보 기준과 동일
+        if np.linalg.norm(points[i] - points[j]) <= 1e-3: 
             raise ValueError("initial_candidates must be distinct and differ from the baseline design")
     return dict(bounds=bounds, candidates=designs, diagnosis=raw["diagnosis"], rationale=raw["rationale"])
 
 
-# OpenAI Responses API 구조화 출력 (팀원 코드와 같은 호출). client는 오프라인 테스트에서만 주입
+# OpenAI API 호출 및 응답 처리
 def call_openai(model, state, client=None):
     if client is None:
         from openai import OpenAI
         if not model or not os.environ.get("OPENAI_API_KEY"):
             raise ValueError("LLM requires OPENAI_MODEL (or --model) and OPENAI_API_KEY in .env or the environment")
-        # API 키는 OPENAI_API_KEY(.env 우선)에서만 읽음. 재시도는 SDK가 429/5xx/timeout에만 적용
         client = OpenAI(timeout=60, max_retries=2)
     response = client.responses.parse(
         model=model,
@@ -275,7 +263,7 @@ def call_openai(model, state, client=None):
         model=model, response_id=response.id, usage=response.usage.model_dump() if response.usage else None)
 
 
-# 오류 메시지를 로그에 남기기 전에 API 키 형태의 문자열을 가림
+# 오류 로그 기록 전 API 키 형식의 문자열 가림
 def safe_error(error):
     text = f"{type(error).__name__}: {error}"
     key = os.environ.get("OPENAI_API_KEY")
@@ -285,10 +273,9 @@ def safe_error(error):
 
 
 ENV_FILE = Path(__file__).resolve().parent / ".env"  # OPENAI_API_KEY, OPENAI_MODEL
-ENV_LOADED = []  # .env에서 읽은 변수 이름 (값은 저장/출력하지 않음)
+ENV_LOADED = [] 
 
 
-# 프로젝트 .env를 읽어 기존 환경변수보다 우선 적용 (빈 값은 건너뜀). 읽은 변수 이름만 반환
 def load_project_env(path=ENV_FILE):
     if path.is_dir():
         print(f"WARNING: {path} is a folder, not a file. Create a .env file in the project folder "
@@ -308,14 +295,13 @@ def load_project_env(path=ENV_FILE):
     return ENV_LOADED
 
 
-def package_version(package):  # import 없이 설치 버전만 확인
+def package_version(package): 
     try:
         return importlib.metadata.version(package)
     except importlib.metadata.PackageNotFoundError:
         return None
 
 
-# API 연결 확인 (시뮬레이션 없음): 패키지, 키 설정 여부, 모델 접근 권한 (토큰을 쓰지 않는 models.retrieve)
 def check_llm(model):
     try:
         from openai import OpenAI
@@ -343,8 +329,7 @@ def check_llm(model):
     return 0
 
 
-# mode: auto(실패/거부 시 --llm off와 같은 BO로 계속) / required(실패/거부 시 중단)
-# response_file: API 대신 저장된 응답 JSON을 쓰는 오프라인 테스트 (모의 응답, LLM 결과 아님)
+# auto는 LLM 실패 시 BO만 계속하고, required는 실행 중단
 def propose_bounds(mode, model, state, folder, response_file=None):
     source = f"file:{response_file}" if response_file else "openai"
     started = time.perf_counter()
@@ -355,7 +340,7 @@ def propose_bounds(mode, model, state, folder, response_file=None):
             request["response_schema"] = advice_model().model_json_schema()
         except ImportError:
             pass
-        dump(folder / "llm_input.json", request)  # 보낼(보냈을) 요청 그대로 저장, API 키 없음
+        dump(folder / "llm_input.json", request)  
         validate_llm_state(state)
         if response_file:
             stored = json.loads(Path(response_file).read_text(encoding="utf-8"))
@@ -365,7 +350,7 @@ def propose_bounds(mode, model, state, folder, response_file=None):
             raw, meta = call_openai(model, state)
             meta["source"] = source
         elapsed = time.perf_counter() - started
-        dump(folder / "llm_response.json", dict(proposal=raw, llm_elapsed_s=elapsed, **meta))  # 검증 전 원본
+        dump(folder / "llm_response.json", dict(proposal=raw, llm_elapsed_s=elapsed, **meta))  
         info = dict(mode=mode, status="accepted", source=source, llm_elapsed_s=elapsed,
                     **validate_advice(raw))
         dump(folder / "llm.json", info)
@@ -381,10 +366,6 @@ def propose_bounds(mode, model, state, folder, response_file=None):
         return info
 
 
-# ---- BO 실행 ----
-
-# 고정 부하 bb에서 BO 실행. init_designs: 외부 지정 초기점,
-# advisor(loaded) -> dict(bounds, candidates) 또는 None (None이면 --llm off와 같은 초기점)
 def run_bo(exe, output, bb, target, n_init=6, n_iter=24, init_designs=None, seed=0, log=print,
            advisor=None):
     rng = np.random.default_rng(seed)
@@ -400,7 +381,7 @@ def run_bo(exe, output, bb, target, n_init=6, n_iter=24, init_designs=None, seed
         history.append(rec)
         best = best_record(history)
         rec["best_error_pct_so_far"] = best["error_pct"] if best else ""
-        with (output / "history.jsonl").open("a", encoding="utf-8") as handle:  # 중단돼도 완료분 보존
+        with (output / "history.jsonl").open("a", encoding="utf-8") as handle: 
             handle.write(json.dumps(jsonable(rec), ensure_ascii=False, allow_nan=False) + "\n")
         log(f'{k:3} {phase:15} RD={rec["rd_ohm"]:9.1f} VG={rec["vg_v"]:.4f} '
             + (f'gain_1k={rec["gain_1k"]:8.4f} err={rec["error_pct"]:8.4f}% '
@@ -408,15 +389,15 @@ def run_bo(exe, output, bb, target, n_init=6, n_iter=24, init_designs=None, seed
                if rec["status"] == "ok" else f'FAILED {rec["error"]}')
             + (f' best={best["error_pct"]:.4f}%' if best else ' best=none'), flush=True)
 
-    run(1, "loaded_baseline", None, {})  # 블랙박스 연결 직후 (Baseline RD, VG)
+    run(1, "loaded_baseline", None, {}) 
     advice = advisor(history[0]) if advisor else None
     bounds = advice["bounds"] if advice else None
-    if advice:  # LLM 후보 3개 -> 남은 초기점은 LLM 추천 범위 안 LHS (모두 같은 평가 예산 안)
+    if advice:
         plan = [("init_llm", dict(d)) for d in advice["candidates"]]
     else:
         plan = [("init_given", dict(d)) for d in init_designs or []]
     unit = qmc.LatinHypercube(d=2, seed=seed).random(max(0, n_init - 1 - len(plan)))
-    if bounds:  # LLM 제안 범위 안으로 초기점 배치 (BO 단계의 후보는 계속 전체 하드 범위)
+    if bounds:
         lo = to_unit(dict(rd_ohm=bounds["rd_ohm"][0], vg_v=bounds["vg_v"][0]))
         hi = to_unit(dict(rd_ohm=bounds["rd_ohm"][1], vg_v=bounds["vg_v"][1]))
         unit = lo + unit * (hi - lo)
@@ -465,7 +446,6 @@ def summarize(bb, target, history, llm_info):
     return summary
 
 
-# 검증용 전수 탐색: 같은 범위를 n x n 격자로 시뮬레이션 (BO 아님)
 def grid_search(exe, output, bb, target, n):
     records = []
     for k, (a, b) in enumerate(itertools.product(np.linspace(0, 1, n), repeat=2), 1):
@@ -486,7 +466,6 @@ def write_csv(path, rows, columns):
         writer.writerows(rows)
 
 
-# 한 Case: (LLM 범위 제안) -> BO -> history/summary 저장
 def diagnose_after_bo(args, exe, folder, bb, target, baseline, history):
     if args.llm == "off" or args.llm_file:
         return {"status": "off" if args.llm == "off" else "skipped_offline", "n_simulations": 0}
@@ -600,7 +579,7 @@ def print_summary(summary):
 
 
 def main(argv=None):
-    load_project_env()  # --model 기본값(OPENAI_MODEL)보다 먼저: 프로젝트 .env가 기존 환경변수보다 우선
+    load_project_env()  
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ngspice", default=DEFAULT_NGSPICE, help="Full path to ngspice_con.exe")
     mode = parser.add_mutually_exclusive_group(required=True)
@@ -642,7 +621,7 @@ def main(argv=None):
         parser.error("Use an ASCII --out path, e.g. C:\\ngspice_project\\bb_results")
     output.mkdir(parents=True)
     root = Path(__file__).resolve().parent
-    # 재현용 설정 기록 (API 키는 기록하지 않고 설정 여부만)
+    # 재현용 설정 기록 
     dump(output / "config.json", dict(
         {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
         bounds={k: list(v) for k, v in BOUNDS.items()}, margin_req_v=MARGIN_REQ,
@@ -684,7 +663,7 @@ def main(argv=None):
                   f'{best}  {summary["result"]}  LLM {summary["llm_mode"]}/{summary["llm_status"]} '
                   f'Post-BO {summary["post_bo_status"]}  {summary["elapsed_s"]:.1f} s', flush=True)
             columns = list(dict.fromkeys(k for s in summaries for k in s))
-            write_csv(output / f"{result_prefix(args.llm)}_summary.csv", summaries, columns)  # Case마다 갱신 (중단 대비)
+            write_csv(output / f"{result_prefix(args.llm)}_summary.csv", summaries, columns) # required 모드에서는 LLM
         restored = sum(s["result"] == "restored_1pct" for s in summaries)
         print(f"\nRestored within 1%: {restored}/{len(summaries)} cases")
     print(f"Results: {output}")
