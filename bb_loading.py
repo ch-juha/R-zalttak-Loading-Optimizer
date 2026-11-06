@@ -1,4 +1,4 @@
-"""Stage-1 CS amp + black box (Rin || Cin, DC-coupled at out1). Standalone (no run_cs.py needed)."""
+"""black box (Rin || Cin) 부하가 연결된 1단 CS 증폭기의 로딩 특성을 측정"""
 import argparse
 import circuit_simulator
 import csv
@@ -11,32 +11,27 @@ import shutil
 import subprocess
 
 DEFAULT_NGSPICE = r"C:\ngspice\Spice64\bin\ngspice_con.exe"
-# 외부 부하 조건 (블랙박스): 한 Case 안에서는 최적화가 끝날 때까지 고정
+# 각 case에선 측정, 최적화 끝날 때까지 부하 조건을 고정
 RIN_OHM = [1000, 1500, 2200, 3300, 4700, 6800, 10000, 22000, 47000, 100000]
 CIN_F = [10e-12, 100e-12, 1e-9, 10e-9, 47e-9]
-# 1단 설계 변수 (향후 BO 탐색 대상), 지정하지 않으면 Baseline 값 사용
+# 1단 설계 변수. 지정하지 않으면 Baseline 값 사용
 DESIGN_KEYS = ("rd_ohm", "vg_v", "cl_f")
 VTH = 0.7  # 넷리스트 모델 VTO와 동일 (동작영역 판별용)
 LAMBDA = 0.01  # 넷리스트 모델 LAMBDA와 동일 (손계산 검증용)
-HAND_TOL_PCT = 1.0  # Saturation에서 손계산-ngspice 일치 판정 기준
+HAND_TOL_PCT = 1.0  # 손계산과 ngspice 결과의 허용 오차 
 
 
-# ---- run_cs.py에서 옮겨온 부분 (회로, 모델, 해석 명령, 측정 방식 동일) ----
-
-# Baseline 값 정의 (run_cs.cases()[0]과 동일)
 def cases():
     return [{"case": "baseline", "group": "baseline", "rd_ohm": 5000,
              "cl_f": 1e-12, "vg_v": 1.2}]
 
-
-# 단일 CS Amp 넷리스트 (run_cs.netlist()와 동일), bb가 있으면 out1에 블랙박스 subckt 추가
 def netlist(row, bb=None):
     text = circuit_simulator.netlist(row)
     return text if bb is None else attach_black_box(text, bb)
 
 
 def attach_black_box(text, bb):
-    """Attach the same black-box load to the netlist's out1 node."""
+    """넷리스트 out1에 동일한 블랙박스 부하 연결"""
     block = (f"XBB out1 BLACKBOX\n.subckt BLACKBOX inp\n"
              f"RIN inp 0 {bb['rin_ohm']:.12g}\nCIN inp 0 {bb['cin_f']:.12g}\n.ends BLACKBOX")
     return text.replace(".control", block + "\n.control", 1)
@@ -53,7 +48,6 @@ def read_number(log, name):
     return value
 
 
-# ngspice 경로: 인자 > PATH의 ngspice_con/ngspice > DEFAULT_NGSPICE
 def find_exe(argument=None):
     if argument:
         candidate = Path(argument).expanduser()
@@ -71,30 +65,26 @@ def operating_region(vgs, vds):
     return "saturation" if vds >= vgs - VTH else "triode"
 
 
-# ngspice 실행 + 파싱 (run_cs.simulate(stage="cs")와 동일, 파일명 규칙 {case}_cs_{iteration:02})
 def simulate(exe, output, row, bb=None, iteration=1):
     return circuit_simulator.simulate(exe, output, row, iteration, netlist_text=netlist(row, bb))
 
 
-# ---- 블랙박스 Case 정의 ----
 
 def _label(rin, cin):
     cap = f"{round(cin * 1e12):g}p" if cin < 1e-9 else f"{round(cin * 1e9, 6):g}n"
     return f"R{rin / 1e3:g}k_C{cap}"
 
 
-# Baseline Rout(RD||ro) ~ 4.88 kOhm 기준 팀 분류
+# 기준 출력저항을 기준으로 부하 세기를 구분
 def rin_class(rin):
     return "strong" if rin <= 3300 else "moderate" if rin <= 10000 else "weak"
 
 
-# 블랙박스 Case 정의: Rin x Cin 전체 조합, Rin 바깥 루프 순서로 BB01..BB50
 def bb_cases():
     return [dict(case_id=f"BB{i:02}", bb_case=_label(r, c), rin_ohm=r, cin_f=c, rin_class=rin_class(r))
             for i, (r, c) in enumerate(itertools.product(RIN_OHM, CIN_F), 1)]
 
 
-# 개수, ID 중복, 조합 중복/누락 검사 (실행 결과 rows에도 그대로 사용 가능)
 def validate_cases(rows):
     expected = set(itertools.product(RIN_OHM, CIN_F))
     pairs = [(row["rin_ohm"], row["cin_f"]) for row in rows]
@@ -122,9 +112,8 @@ def find_case(name):
     raise SystemExit(f"Unknown case {name}; run with --list to see case IDs")
 
 
-# ---- 측정, 지표, 손계산 ----
 
-# 1단 회로 row: Baseline에서 설계 변수만 덮어씀 (Rin/Cin은 여기 들어오지 않음)
+
 def stage1_row(design=None, case="stage1"):
     unknown = set(design or {}) - set(DESIGN_KEYS)
     if unknown:
@@ -136,8 +125,7 @@ def _pct(value, reference):
     return (value - reference) / reference * 100 if reference else math.nan
 
 
-# 측정 동작점으로 계산한 손계산 값: |Av| = gm (RD||ro||Rin) / sqrt(1 + (f/f_p)^2),
-# f_p = 1/(2 pi (RD||ro||Rin)(CL+Cin)). Saturation 가정이므로 다른 영역은 비교 불가로 표시
+# 측정 동작점으로 근사이득과 극점 계산. saturation region에서만 비교
 def hand_check(row, bb, values):
     gds = LAMBDA * values["id_dc"] / (1 + LAMBDA * values["vds1"])
     conductance = 1 / row["rd_ohm"] + gds + (1 / bb["rin_ohm"] if bb else 0)
@@ -167,7 +155,7 @@ def metrics(target, values):
                 retention_100k_pct=values["gain_100k"] / target * 100)
 
 
-# Target Gain = Baseline 단독(부하 없음) 1 kHz |Av|, 이후 변경 금지
+# Target Gain = Baseline 단독(부하 없음) 1 kHz |Av|
 def measure_target(exe, output):
     row = stage1_row(case="target")
     try:
@@ -180,7 +168,7 @@ def measure_target(exe, output):
     return target, record
 
 
-# BO 등에서 재사용할 단일 평가: 고정 부하 bb + 1단 설계 design -> 측정/지표 record (예외 대신 status)
+# 시뮬레이션 실패도 결과 표에 남기기 위하여 status로 처리
 def evaluate(exe, output, bb, target, design=None, tag="base", iteration=1):
     row = stage1_row(design, f"{bb['case_id']}_{tag}")
     stem = f"{row['case']}_cs_{iteration:02}"  # simulate()의 파일명 규칙
@@ -252,7 +240,7 @@ def main(argv=None):
     mode.add_argument("--list", action="store_true", help="Print and validate the case table only")
     parser.add_argument("--out", type=Path, default=Path(__file__).resolve().parent / "bb_results")
     args = parser.parse_args(argv)
-    case_table = bb_cases()  # cases()(Baseline 정의)와 이름이 겹치지 않도록 구분
+    case_table = bb_cases()  
     print(f"Case table OK: {validate_cases(case_table)} cases "
           f"({len(RIN_OHM)} Rin x {len(CIN_F)} Cin, unique IDs and pairs)")
     if args.list:
@@ -261,7 +249,7 @@ def main(argv=None):
                   f'Cin={bb["cin_f"]:.3g} F  {bb["rin_class"]}')
         return 0
     exe = find_exe(args.ngspice)
-    # ngspice는 긴(>MAX_PATH) 경로에서 로그를 못 만들기 때문에 짧은 ASCII 경로 유지
+    # ngspice는 긴 경로에서 로그를 만들지 못할 수 있어 짧은 ASCII경로를 사용
     output = args.out.resolve() / datetime.now().strftime("loading_%Y%m%d_%H%M%S")
     if not str(output).isascii():
         parser.error("Use an ASCII --out path, e.g. C:\\ngspice_project\\bb_results")
@@ -285,7 +273,7 @@ def main(argv=None):
             print(f'{bb["case_id"]} {bb["bb_case"]}: failed ({record["error"]})', flush=True)
     write_csv(output / "loading.csv", records)
     if args.all:
-        validate_cases(records)  # 결과 파일에도 50개 조합이 빠짐없이 들어갔는지 재확인
+        validate_cases(records)
     summarize(records)
     print(f"Results: {output / 'loading.csv'}\nBaseline: {output / 'baseline.csv'}")
     return 0 if all(r["status"] == "ok" for r in records) else 1
