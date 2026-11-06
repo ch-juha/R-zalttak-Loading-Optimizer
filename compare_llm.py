@@ -1,7 +1,4 @@
-"""Run BO only (--llm off) and LLM+BO on one case with the same seed and 30-evaluation budget, then compare.
-
-Real API:      py compare_llm.py --case BB42      (OPENAI_API_KEY and OPENAI_MODEL in the project .env)
-Offline test:  py compare_llm.py --case BB42 --llm-file llm_mock\\advice_valid.json   (mock, not an LLM)
+"""같은 Case·시드·평가 예산에서 BO 단독과 LLM+BO를 비교
 """
 import argparse
 import csv
@@ -34,7 +31,6 @@ def read_json(path):
     return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
 
 
-# bo_opt.main()을 그대로 호출 (BO 코드 재사용), 결과 폴더 경로 반환
 def run(label, root, case, seed, ngspice, extra):
     folder = root / label
     folder.mkdir()
@@ -53,7 +49,7 @@ def fmt(value):
 
 
 def main(argv=None):
-    bo_opt.load_project_env()  # 프로젝트 .env가 기존 환경변수보다 우선 (--model 기본값보다 먼저)
+    bo_opt.load_project_env()  
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--case", default="BB42")
     parser.add_argument("--seed", type=int, default=0)
@@ -77,7 +73,7 @@ def main(argv=None):
     extra = ["--llm", args.llm] + (["--llm-file", str(args.llm_file)] if args.llm_file else ["--model", args.model])
     try:
         llm_dir = run("llm_bo", root, bb["case_id"], args.seed, args.ngspice, extra)
-    except RuntimeError as error:  # --llm required에서 LLM 실패/거부
+    except RuntimeError as error:  # required 모드에서 LLM 실패시 비교 중단
         print(f"\nLLM+BO stopped (--llm {args.llm}): {error}\nBO-only result kept in {bo_dir}")
         return 3
 
@@ -91,7 +87,7 @@ def main(argv=None):
         writer.writerow(["metric", "label", "bo_only", "llm_bo"])
         for key, label in ROWS:
             writer.writerow([key, label, summaries["bo_only"].get(key, ""), summaries["llm_bo"].get(key, "")])
-    # 평가 번호별 현재까지 최선 오차 (수렴 곡선)
+    
     with (root / "convergence.csv").open("w", newline="", encoding="utf-8-sig") as handle:
         writer = csv.writer(handle)
         writer.writerow(["iteration"] + [f"{name}_{col}" for name in histories
