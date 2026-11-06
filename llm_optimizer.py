@@ -1,4 +1,4 @@
-"""외부 BO가 사용하는 CS 회로 분석 및 RD·VG 탐색 범위 제안 모듈입니다."""
+"""외부 BO가 사용하는 CS 회로 분석 및 RD,VG 탐색 범위 제안 모듈"""
 
 import json
 import math
@@ -7,23 +7,16 @@ from pathlib import Path
 from typing import Literal
 
 def dump(path, value):
-    """설정·LLM 응답·요약을 사람이 읽기 쉬운 UTF-8 JSON 파일로 저장합니다."""
-    # 한글을 그대로 저장하며, JSON 표준에 없는 NaN/Infinity는 허용하지 않습니다.
+    """설정·LLM 응답을 UTF-8 JSON 파일로 저장""".
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
 
 
 def validate_bounds(bounds, hard):
-    """LLM의 제안을 검사하여 사용자 하드 한계 안의 RD/VG 범위만 통과시킵니다.
-
-    bounds/hard 예: {"rd_ohm": [1000, 30000], "vg_v": [0.75, 2.0]}
-    하드 한계는 사용자가 지정한 절대 탐색 한계이며 LLM이 넓힐 수 없습니다.
-    """
-    # LLM이 CL이나 부하 값을 새 설계 변수로 추가하지 못하게 키도 검사합니다.
+    # LLM 제안 중 하드 한계 안의 RD, VG 범위만 반환
     if set(bounds) != set(hard):
         raise ValueError("Bounds must contain only rd_ohm and vg_v")
     result = {}
     for key, pair in bounds.items():
-        # bool은 Python에서 숫자처럼 취급되지만 유효한 회로 파라미터는 아닙니다.
         if len(pair) != 2 or any(isinstance(v, bool) or not math.isfinite(v) for v in pair):
             raise ValueError(f"Invalid bounds: {key}")
         lo, hi = map(float, pair)
@@ -48,7 +41,7 @@ def _openai_client(model):
 
 
 def propose_circuit_change(state, model):
-    """BO 종료 후 측정값을 근거로 회로 유지 또는 SF 검증을 제안합니다."""
+    # BO 결과를 바탕으로 CS 유지 또는 SF 검증을 제안
     from pydantic import BaseModel
 
     class CircuitAdvice(BaseModel):
@@ -77,17 +70,15 @@ def propose_circuit_change(state, model):
 
 
 def propose_bounds(state, hard, cfg, folder, *, current_bounds=None):
-    """회로 상태를 분석하고 검증된 RD·VG 범위를 반환합니다."""
+    # 회로 상태를 분석해 검증된 RD, VG 범위를 반환
     fallback = hard if current_bounds is None else validate_bounds(current_bounds, hard)
     if cfg.llm == "off":
         dump(folder / "llm.json", {"mode": "off", "bounds": fallback})
         return fallback
     try:
-        # 선택 기능이므로 off 모드에서는 OpenAI/Pydantic을 import하지 않습니다.
         from pydantic import BaseModel
 
         class Bounds(BaseModel):
-            # 모델이 반환해야 하는 구조입니다. 단위가 다른 kΩ/mV 대신 Ω/V를 씁니다.
             rd_min_ohm: float
             rd_max_ohm: float
             vg_min_v: float
@@ -95,8 +86,7 @@ def propose_bounds(state, hard, cfg, folder, *, current_bounds=None):
             reasoning: str
 
         response = _openai_client(cfg.model).responses.parse(
-            # 60초 제한이며 SDK 자동 재시도는 끕니다.
-            # state에는 측정값/조건이 포함되며 API 키 자체는 전달·저장하지 않습니다.
+            # 측정값만 전달
             model=cfg.model,
             input=[{"role": "system", "content":
                     "Analyze CS loading and suggest RD/VG bounds for the next BO iterations. "
@@ -120,8 +110,7 @@ def propose_bounds(state, hard, cfg, folder, *, current_bounds=None):
         dump(folder / "llm.json", {"mode": "llm", "bounds": bounds, "reasoning": p.reasoning})
         return bounds
     except Exception as error:
-        # required 모드를 사용자 모르게 BO 전용 실행으로 바꾸지 않습니다.
-        # auto 모드의 대체 실행 여부도 로그에서 구분할 수 있게 저장합니다.
+        # required는 중단하고 auto는 기존 탐색 범위를 유지
         dump(folder / "llm.json", {"mode": "failed", "error_type": type(error).__name__,
                                    "fallback": cfg.llm == "auto", "bounds": fallback})
         if cfg.llm == "required":
@@ -131,7 +120,7 @@ def propose_bounds(state, hard, cfg, folder, *, current_bounds=None):
 
 
 def _json_safe(value):
-    """실패한 측정의 비유한값을 JSON null로 표현합니다."""
+    """비유한 측정값을 JSON null로 변환"""
     if isinstance(value, float) and not math.isfinite(value):
         return None
     if isinstance(value, dict):
@@ -143,14 +132,7 @@ def _json_safe(value):
 
 def update_search_bounds(*, hard_bounds, current_bounds, context, recent_evaluations,
                          best_evaluation, step, cfg, log_dir):
-    """외부 BO의 체크포인트에서 다음 후보 생성에 사용할 범위를 반환합니다.
-
-    step은 완료된 BO 평가 수입니다. context에는 목표 이득, 부하, 제약 등을 담습니다.
-    recent_evaluations는 최신 평가 목록이며 best_evaluation은 BO가 선정한 최선점입니다.
-    첫 호출에서는 current_bounds와 best_evaluation에 None을 전달할 수 있습니다.
-    cfg.llm은 off/auto/required이며 cfg.model은 호출할 모델 ID입니다.
-    log_dir은 실행과 부하 케이스마다 구분된 경로를 사용합니다.
-    """
+    """외부 BO의 다음 후보 생성에 사용할 탐색 범위를 반환"""
     if type(step) is not int or step < 0:
         raise ValueError("step must be a nonnegative integer")
     if cfg.llm not in ("off", "auto", "required"):
