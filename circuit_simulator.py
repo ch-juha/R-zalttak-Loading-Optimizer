@@ -1,8 +1,6 @@
-"""기준 CS 회로 하나와 ngspice 실행을 담당하는 공통 모듈입니다.
+"""기준 1단 CS 회로의 넷리스트 생성과 ngspice 실행을 담당
 
-여러 RD/CL/VG 조합을 생성하는 스윕 기능은 포함하지 않습니다.
-기준 회로: VDD=5 V, RD=5 kΩ, VG=1.2 V, CL=1 pF, W/L=20u/1u.
-블랙박스 연결은 bb_loading.py, RD/VG 탐색은 bo_opt.py가 담당합니다.
+기준 조건: VDD=5V, RD=5 kΩ, VG=1.2 V, CL=1 pF
 """
 import argparse
 from datetime import datetime
@@ -15,11 +13,7 @@ import subprocess
 
 
 def baseline_row(design=None, case="baseline"):
-    """기준 회로를 새 사전으로 반환하고 요청한 설계값만 덮어씁니다.
-
-    호출마다 독립 사전을 만들어 BO 후보가 원래 기준값을 바꾸지 않게 합니다.
-    cl_f=None은 커패시터 미장착이며 최적화기에서는 기본 1 pF를 유지합니다.
-    """
+    # 기준 회로에 요청한 설계값을 반영한 새 사전을 반환
     design = design or {}
     if set(design) - {"rd_ohm", "vg_v", "cl_f"}:
         raise ValueError("Unknown stage-1 design variable")
@@ -38,13 +32,8 @@ def baseline_row(design=None, case="baseline"):
     return row
 
 
-# 단일 CS 회로의 소자·모델·측정 조건은 기존 코드와 동일합니다.
 def netlist(row, *, rs2_ohm=None):
-    """1단 CS 회로와 OP/AC 측정 명령을 ngspice 텍스트로 생성합니다.
-
-    AC 입력 크기는 1 V이므로 vm(out1)이 곧 이득 크기(V/V)입니다.
-    gain_1k와 gain_100k는 각각 1 kHz, 100 kHz에서 측정합니다.
-    """
+    """1단 CS 회로와 OP/AC 측정 명령을 ngspice 텍스트로 생성"""
     loads = []
     if row["cl_f"] is not None:
         loads.append(f'CL out1 0 {row["cl_f"]:.12g}')
@@ -87,7 +76,7 @@ quit 0
 """
 
 def read_number(log, name):
-    """ngspice 로그의 '측정이름 = 숫자'를 읽고 유한한 실수인지 확인합니다."""
+    # ngspice 로그에서 유한한 측정값을 읽음
     pattern = rf"^\s*{re.escape(name)}\s*=\s*([-+]?\d+(?:\.\d*)?(?:[eE][-+]?\d+)?)"
     match = re.search(pattern, log, re.MULTILINE | re.IGNORECASE)
     if not match:
@@ -98,7 +87,7 @@ def read_number(log, name):
     return value
 
 def find_exe(argument):
-    """명시 경로 → PATH → 기존 PC 설치 경로 순으로 ngspice 파일을 찾습니다."""
+    # 명시 경로, PATH, 기본 경로 순으로 ngspice 실행 파일을 찾음.
     if argument:
         candidate = Path(argument).expanduser()
     else:
@@ -110,28 +99,22 @@ def find_exe(argument):
     return candidate.resolve()
 
 def operating_region(vgs, vds):
-    """현재 LEVEL=1 모델의 Vth=0.7 V로 cutoff/triode/saturation을 분류합니다."""
+    # LEVEL=1 모델의 Vth=0.7 V로 cutoff/triode/saturation을 분류
     if vgs <= 0.7 + 1e-9:
         return "cutoff"
     return "saturation" if vds >= vgs - 0.7 else "triode"
 
 
 def simulate(exe, output, row, iteration=1, *, netlist_text=None, timeout=60, rs2_ohm=None):
-    """회로 한 개를 ngspice로 실행하고 측정 결과를 반환합니다.
-
-    netlist_text가 있으면 해당 회로를 실행하고, 없으면 기준 CS 회로를 생성합니다.
-    블랙박스 연결을 위해 전역 함수를 임시 교체할 필요가 없습니다.
-    실패는 예외로 전달하며 bb_loading.evaluate()가 실패 레코드로 변환합니다.
-    """
+    # 회로 한 개를 ngspice로 실행하고 측정 결과를 반환
     output = Path(output).resolve()
     output.mkdir(parents=True, exist_ok=True)
-    # 파일명으로 사용하는 이름과 실제 설계값을 실행 전에 검증합니다.
     baseline_row({k: row[k] for k in ("rd_ohm", "vg_v", "cl_f")}, row["case"])
     stage = "cs" if rs2_ohm is None else "two_stage"
     stem = f"{row['case']}_{stage}_{iteration:02}"
     cir = output / (stem + ".cir")
     log_path = output / (stem + ".log")
-    # 이전 로그를 새 측정으로 오인하지 않고 기존 결과도 덮어쓰지 않습니다.
+    # 이전 로그 재사용하거나 덮어쓰지 않도록 파일명 확인
     if cir.exists() or log_path.exists():
         raise ValueError(f"Simulation files already exist: {stem}")
     cir.write_text(netlist(row, rs2_ohm=rs2_ohm) if netlist_text is None else netlist_text, encoding="ascii")
@@ -142,7 +125,7 @@ def simulate(exe, output, row, iteration=1, *, netlist_text=None, timeout=60, rs
         with log_path.open("ab") as handle:
             handle.write(b"\nSimulation timeout\n" + (error.stdout or b"") + (error.stderr or b""))
         raise
-    # stdout/stderr도 별도 보존하여 ngspice의 실행 단계 오류를 확인할 수 있게 합니다.
+    # 실행 오류 확인할 수 있도록 stdout/stderr도 별도 저장
     (output / (stem + ".process.log")).write_bytes(result.stdout + b"\n" + result.stderr)
     if not log_path.exists():
         log_path.write_bytes(result.stdout + b"\n" + result.stderr)
@@ -151,7 +134,7 @@ def simulate(exe, output, row, iteration=1, *, netlist_text=None, timeout=60, rs
     log = log_path.read_text(encoding="utf-8", errors="replace")
     values = {name: read_number(log, name) for name in
               ("vout_dc", "id_dc", "gm_s", "gain_1k", "gain_100k")}
-    # 소스가 접지된 현재 CS 모델에서는 VDS=Vout, VGS=VG입니다.
+
     values.update(vds1=values["vout_dc"], vgs1=row["vg_v"], vdsat1=row["vg_v"] - .7)
     if rs2_ohm is not None:
         values.update({name: read_number(log, name) for name in
@@ -166,7 +149,7 @@ def simulate(exe, output, row, iteration=1, *, netlist_text=None, timeout=60, rs
 
 
 def main(argv=None):
-    """직접 실행하면 블랙박스 없는 기준 회로 하나만 측정합니다."""
+    # 직접 실행 시 무부하 기준 회로를 측정
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ngspice", help="ngspice 실행 파일 경로")
     parser.add_argument("--out", type=Path, default=Path(__file__).parent / "baseline_results")
